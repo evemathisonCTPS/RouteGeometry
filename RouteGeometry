@@ -1,0 +1,509 @@
+# ----------------------------------------------------------------------------------------------------------------------#
+#
+#                                   ROUTE GEOMETRICAL CHARACTERISTICS NIGHTLY SCRIPT
+#
+# This script calculates useful geometrical characteristics for each route in the ALRS. Characteristics of interest for
+# route editors are: the number of parts in a feature, whether the feature is multipart, whether any parts ar spatially
+# disjoint from one another, the number of disjoint spatial groups, whether the feature contains a closed loop, and
+# whether the feature contains arc segments which are not supported by R & H. These properties are intended to help
+# route editors identify problematic features. This script is critical for the RPRD script to work as it marks arc
+# routes, which cause the RPRD script to fail. Once marked, the RPRD script can ignore them. The cycle type determined
+# # by this script also allows the RPRD script to find measure values for priority events much more efficiently.
+#
+# A central part of this script is cycle detection, which tests the geometry of each route for closed loops. Cycles are
+# grouped into 5 categories:
+#     1: Isolated loop: E.g. a route comprising only the circular section of a rotary or cul-de-sac.
+#     2: Cul-de-sac: A closed loop attached to a linear segment leading to a more major road.
+#     3: Alpha: A route which crosses over itself but continues in either direction. E.g. a state route containing a
+#        cloverleaf interchange.
+#     4: Complex: E.g. a branched route comprising a circular rotary and multiple inlet/outlet segments.
+#     5. Multipart pseudocycle: A multipart route in which no single part contains a closed loop, but the assembly of
+#        the multiple parts nevertheless results in a circular path within the route.
+#
+# Eve Mathison (CTPS) 2021 for MassDOT, updated 2022.
+#
+# ---------------------------------------------------------------------------------------------------------------------#
+
+import os
+import tempfile
+from itertools import combinations
+import tempfile
+import traceback
+import csv
+import datetime as dt
+
+from arcgis.gis import GIS
+from arcgis.features.layer import FeatureLayerCollection
+from arcgis.geometry import Geometry
+import arcpy
+
+
+# Main analysis function.
+def main():
+    try:
+        # Step 0: Initialize script variables and cycle type dictionary.
+        failurepoint = 0
+        numupdated = 0
+        version = None
+        routeview = 'Undefined'
+        GDB = 'Undefined'
+        tempdir = 'Undefined'
+
+        RPRDlog = r"C:\MassDOT-Scripts\logs\RPRD_NightlyLog.csv"
+        portalurl = 'https://gisstg.massdot.state.ma.us/portal'
+        flcurl = 'https://gisstg.massdot.state.ma.us/rh/rest/services/RHPro/RHPro_LRSNetworkManagement_Service/FeatureServer'
+
+        sde = r"C:\MassDOT-Scripts\database_connections\STG_RH_DEFAULT as geodotadmin BRANCH.sde"
+        routes = os.path.join(sde, "RH.DBO.ALRS\\RH.DBO.LRSN_Routes")
+
+        tempdir = tempfile.mkdtemp()
+        GDB = arcpy.CreateFileGDB_management(tempdir, 'temp.gdb')
+        GDBpath = arcpy.Describe(GDB).catalogPath
+
+        arcpy.env.overwriteOutput = True
+
+        # Cycle types can be identified based on 3 criteria: whether a shape contains a closed loop, whether a single
+        # piece of geometry causes the loop, and the number of parts of the route adjacent to the loop.
+        cycletypes = {
+                      (0, 0, 0): 0,  # No cycle
+                      (1, 1, 0): 1,  # Isolated loop
+                      (1, 1, 1): 2,  # Cul-de-sac
+                      (1, 1, 2): 3,  # Alpha
+                      (1, 1, 3): 4,  # Complex
+                      (1, 0, 0): 5   # Multipart pseudocycle
+                      }
+
+
+
+
+        # Step 1: Get the timestamp of the last RPRD run. Routes edited since this point will need to have their
+        # geometry reanalyzed.
+        failurepoint = 1
+
+        with open(RPRDlog, "r") as log:
+
+            # Use the log header to get the indices of the result flag (success or failure) and end time fields. Also
+            # get the character index of the end of the header, which marks the beginning of real log entries.
+            header = log.readline().split(",")
+            resultidx = header.index("Result")
+            endidx = header.index("End time")
+            headerend = log.tell()
+            filend = False
+            log.seek(0, os.SEEK_END)
+            log.seek(log.tell()-3, os.SEEK_SET)
+
+            # Loop through log entries beginning with the most recent line to find the most recent successful run.
+            while not filend:
+
+                # Find the next line break backwards, beginning from the end.
+                while log.read(1) != '\n':
+                    log.seek(log.tell()-2, os.SEEK_SET)
+
+                # Get the index of the linebreak and read the following line.
+                lb = log.tell()
+                line = log.readline()
+
+                # If the line is a successful log entry, set the change detection date to the line's end timestamp.
+                if line.split(",")[resultidx] == "Success":
+                    filend = True
+                    changedate = line.split(",")[endidx]
+
+                # Otherwise, a successful entry has not yet been found. If there are more lines between the one just
+                # read and the beginning of real entries, set the file cursor to begin reading the previous line.
+                # Otherwise, does not contain a successful run, so the change detection date is set to 1/1/1900.
+                else:
+                    if headerend < lb:
+                        log.seek(lb - 3, os.SEEK_SET)
+                    else:
+                        filend = True
+                        changedate = dt.datetime.strptime("01/01/1900 00:00:00", "%d/%m/%Y %H:%M:%S")
+        del log
+
+
+
+
+        # Step 2: Connect to the Enterprise server that houses the routes feature service and create a dedicated
+        # branch version (thanks, ESRI).
+        failurepoint = 2
+
+        # Connect to the enterprise portal with admin credentials.
+        gis = GIS(portalurl, 'portaladmin', 'MASSDot_admin5309')
+
+        # Connect to the feature service and route feature layer.
+        flc = FeatureLayerCollection(flcurl, gis)
+        routelayer = flc.layers[76]
+
+        # Create and connect to a dedicated branch version, overwriting any existing version of the same name.
+        vms = flc.versions
+        if 'portaladmin.RouteGeo_Nightly' in [ver.properties.versionName for ver in vms.all]:
+            delver = vms.get('portaladmin.RouteGeo_Nightly')
+            delver.delete()
+        vms.create('RouteGeo_Nightly', 'private')
+
+        version = vms.get('portaladmin.RouteGeo_Nightly', "edit")
+        versionname = version.properties.versionName
+        sessionid = version._guid
+
+
+
+
+        # Step 3: Determine characteristics of each route feature. The feature's geometry is broken down to determine
+        # if a route is multipart, the number of parts, whether all parts touch, if the route self-crosses, the nature
+        # of the self-crossing, and if it contains arc segments.
+        failurepoint = 3
+
+        # Query the route feature layer twice, once returning geometry and once not. The query result with geometry
+        # will be used to crack route geometry, while the result without geometry will be used to update geometrical
+        # attributes. This prevents the geometry itself from being updated, which can cause catastrophic problems.
+        routeview = makeCurrentView(routes, GDBpath, 'RouteView')
+
+        query = f"Date_Edited > date'{changedate}' OR ContainsArc IS NULL"
+        geofields = 'OBJECTID, Route_ID, NumParts, IsMultipart, NumGroups, IsDisjoint, CycleType, ContainsArc, Route_Qualifier'
+        queryresnogeo = routelayer.query(query, geofields, return_geometry=False, order_by_fields='OBJECTID ASC')
+
+        with arcpy.da.SearchCursor(routeview, ['Orig_OID', 'SHAPE@'], where_clause=query, sql_clause=(None, 'ORDER BY Orig_OID')) as shapecursor:
+
+            # Loop through the route features in chunks, so that edits can be pushed to the server in small batches.
+            for editfeat in chunkQuery(queryresnogeo, 100):
+                for row in editfeat:
+
+                    shaperow = shapecursor.next()
+                    shape = shaperow[1]
+
+                    # Make sure the FGDB geometry matches the target server OID.
+                    assert row.attributes['OBJECTID'] == shaperow[0]
+
+                    # If the shape is null or zero length, assign null to geometrical attributes.
+                    if shape is None or shape.length <= 0:
+                        ismultipart = None
+                        numgroups = None
+                        isdisjoint = None
+                        cycletype = None
+                        containsarc = None
+                        numparts = None
+
+                    else:
+
+                        # Check for arc segments.
+                        if shape.hasCurves:
+                            containsarc = 1
+                        else:
+                            containsarc = 0
+
+                        # Initialize loop-related geometry variables. The default is no loop in the route.
+                        hascycle = 0
+                        cycleshape = None
+
+                        # Multipart features need to be checked for disjoint parts (parts which do not spatially touch
+                        # each other). This is done with a disjoint-set structure, which incidentally tests whether a
+                        # loop formed by multiple linear parts exists.
+                        if shape.isMultipart:
+                            ismultipart = 1
+                            numparts = shape.partCount
+                            setstruct = SetStruct(shape)
+                            numgroups = setstruct.numGroups
+                            isdisjoint = 1 if numgroups > 1 else 0
+                            hascycle = setstruct.hasCycle
+                            infeat = shape
+
+                        # If the shape is singlepart, the number of parts and number of disjoint spatial groups is 1.
+                        else:
+                            ismultipart = 0
+                            numparts = 1
+                            numgroups = 1
+                            isdisjoint = 0
+                            infeat = shape
+
+                        # Dissolving the route shape will split the feature up anywhere it self-crosses. The sections
+                        # of the route between self-crossings will become circular features whose first point is
+                        # coincident with its last point. Checking for these features determines whether a "true" cycle
+                        # exists (one not formed by multiple linear parts).
+                        dissolves = arcpy.management.Dissolve(infeat, arcpy.Geometry(),
+                                                             multi_part='SINGLE_PART', unsplit_lines='DISSOLVE_LINES')
+
+                        cycletest = [s.firstPoint.equals(s.lastPoint) for s in dissolves]
+
+                        # If a true cycle exists, the route contains a cycle and we can check what kind of cycle it is
+                        # (isolated loop, cul-de-sac, alpha, or complex).
+                        if any(cycletest):
+                            hascycle = 1
+                            cycleshape = dissolves[cycletest.index(True)]
+                            dissolves.remove(cycleshape)
+
+                            # The number of dissolved route sections determines a cycle type. An isolated loop is
+                            # adjacent to nothing else because the whole route is circular. A cul-de-sac is adjacent to
+                            # one section, the road leading into the the cul-de-sac. And alpha loop is adjacent to 2
+                            # sections, the roads leading into and out of the alpha region. A complex cycle (e.g. a
+                            # rotary) could be adjacent to N>2 route sections leading towards/away from the loop.
+                            numadj = 0
+                            i = 0
+                            while numadj < 3 and i < len(dissolves):
+                                if not dissolves[i].disjoint(cycleshape):
+                                    numadj += 1
+                                i += 1
+
+                        # If the route contains a cycle but no part of the dissolved route closes on itself, the cycle
+                        # must be caused by multiple parts of a multipart feature assembling into a closed loop. A true
+                        # cycle doesn't exist and is therefore not adjacent to anything.
+                        elif hascycle:
+                            numadj = 0
+
+                        # If no cycle is found, the route has no cycle and no adjacencies to the cycle.
+                        else:
+                            hascycle = 0
+                            numadj = 0
+
+                        # Use geometrical properties of the shape to get cycle type: whether a cycle exists, whether a
+                        # true cycle was found, and the number of road sections adjacent to the cycle.
+                        cycletype = cycletypes[(hascycle, 1 if cycleshape is not None else 0, numadj)]
+
+
+                    row.attributes['NumParts'] = numparts
+                    row.attributes['IsMultipart'] = ismultipart
+                    row.attributes['NumGroups'] = numgroups
+                    row.attributes['IsDisjoint'] = isdisjoint
+                    row.attributes['CycleType'] = cycletype
+                    row.attributes['ContainsArc'] = containsarc
+                    numupdated += 1
+
+                # Push the current batch of edits to the server.
+                routelayer.edit_features(updates=editfeat, gdb_version=versionname, session_id=sessionid)
+
+        # Save all edits to the version.
+        version.stop_editing(True)
+
+
+
+
+        # Step 4: Reconcile, post and delete the version.
+        failurepoint = 4
+        version.start_editing()
+        version.reconcile()
+        version.post()
+        version.stop_editing()
+        version.stop_reading()
+        version.delete()
+
+
+
+
+        # Step 5: If the script finished successfully, set the failurepoint to "No Error".
+        failurepoint = -1
+        errstr = 'None'
+
+
+
+
+    # Capture any error message to record in the log.
+    except Exception as e:
+        linenum = traceback.format_exc().split("line ")[1].split(",")[0]
+        errstr = "Line {}: {}".format(linenum, repr(e))
+
+    finally:
+
+        # Delete the dedicated version if it still exists.
+        try:
+            version.delete()
+        except:
+            pass
+
+        for c in (routeview, GDB, tempdir):
+            if arcpy.Exists(c):
+                try:
+                    arcpy.management.Delete(c)
+                except:
+                    pass
+
+        # Return a summary of the script's run: the failurepoint, any error, and the number of routes updated.
+        return failurepoint, errstr, numupdated
+
+
+
+def makeCurrentView(source_fc, target_path, target_fc):
+
+    # Function to make a view of the input database feature class for the default database version. With the migration
+    # to ArcPro, queries to the enterprise database no longer act on the table rows in the default version; instead,
+    # queries pick up archived rows and rows in other database versions as well. However, many queries need to look at
+    # active default rows only. This function uses GDB archive indexes and version numbers to recreate the
+    # functionality a default database view provided in ArcMap. Because of (ongoing) limitations to creating tables in
+    # an SDE database, a table must be on standby to receive the rows of the database view.
+    # Requires the source table from which to make a view and the target table as input.
+
+    intbldesc = arcpy.Describe(source_fc)
+
+    # Get the name of the enterprise database housing the source table. If the table is stored in a feature dataset,
+    # the path to the .sde database connection is one level higher than the table's directory.
+    SDE = os.path.dirname(intbldesc.catalogPath)
+    if os.path.splitext(SDE)[1] != '.sde':
+        SDE = os.path.dirname(SDE)
+
+    tablename = intbldesc.name
+    viewquery = f'''SELECT TBL.*, TBL.OBJECTID AS Orig_OID
+                    FROM {tablename} AS TBL
+
+                    INNER JOIN (
+
+     	                SELECT MAX(TBL2.GDB_ARCHIVE_OID) as Max_GDB_OID
+    	                FROM {tablename} AS TBL2
+    	                GROUP BY TBL2.OBJECTID, TBL2.GDB_BRANCH_ID
+    	                HAVING TBL2.GDB_BRANCH_ID = 0
+
+                    ) TBLJoin
+
+                    ON   TBL.GDB_ARCHIVE_OID = TBLJoin.Max_GDB_OID
+                     AND TBL.GDB_IS_DELETE = 0'''
+
+    # Execute the query with spatial arguments that match the source data.
+    shapetype = intbldesc.shapeType
+    srid = str(intbldesc.spatialReference.factoryCode)
+    spatialreference = intbldesc.spatialReference
+    spatialprops = 'DEFINE_SPATIAL_PROPERTIES'
+
+    if intbldesc.hasM:
+        includeM = 'INCLUDE_M_VALUES'
+    else:
+        includeM = 'DO_NOT_INCLUDE_M_VALUES'
+
+    if intbldesc.hasZ:
+        includeZ = 'INCLUDE_Z_VALUES'
+    else:
+        includeZ = 'DO_NOT_INCLUDE_Z_VALUES'
+
+    ql = arcpy.management.MakeQueryLayer(SDE, 'CurrentViewLyr', viewquery, 'OBJECTID', shapetype,
+                                         srid, spatialreference, spatialprops, includeM, includeZ)
+
+    # Replace the rows in the target table with rows returned by the query.
+    target = arcpy.conversion.FeatureClassToFeatureClass(ql, target_path, target_fc)
+    return target
+
+
+def chunkQuery(res1, chunkSize):
+    # Function to split the feature lists returned by parallel queries into chunks of desired length. Parallel queries are
+    # ones which return the same feature sets,but with different attribute sets for the features.
+
+    # Iteratively return lists of features (length between 1 and chunkSize) from the two query results. The lists
+    # contain the same features, but with differing attributes as specified by the query.
+    for i in range(0, len(res1), chunkSize):
+        yield res1.features[i:i+chunkSize]
+
+
+def writeLog(logfile, times, results):
+
+    # Function to write the the output log the script's start time; end time; run time; the outcome (success or failure);
+    # the failurepoint; any error message; the number of routes whose geometry info fields were updated.
+
+    failurepoints = {0: 'Unable to initialize parameters',
+                     1: 'Unable to read change detection date from log',
+                     2: 'Unable to switch to dedicated version',
+                     3: 'Unable to calculate geometry',
+                     4: 'Unable to reconcile/post edits',
+                     -1: 'None'
+                     }
+    failurepoint = failurepoints[results[0]]
+
+    # Get start time, end time, and runtime in string form.
+    startstr = dt.datetime.strftime(times[0], "%m/%d/%Y %H:%M:%S")
+    endstr = dt.datetime.strftime(times[1], "%m/%d/%Y %H:%M:%S")
+
+    runtime = times[1] - times[0]
+    hours = runtime.seconds // 3600
+    minutes = (runtime.seconds % 3600) // 60
+    seconds = runtime.seconds % 60
+    runtimestr = "{}h {}m {}s".format(("%02d" % hours), ("%02d" % minutes), ("%02d" % seconds))
+
+    # Use the failurepoint to determine if the script's run was successful.
+    if results[0] < 0:
+        outcome = "Success"
+    else:
+        outcome = "Failure"
+
+    # Write the logging information to the CSV log.
+    with open(logfile, "a") as log:
+        writer = csv.writer(log, lineterminator="\n")
+        writer.writerow((startstr, endstr, runtimestr, outcome, failurepoint, results[1], results[2]))
+
+
+# Class that uses disjoint-set structures to determine if a multipart route feature contains disjoint groups of parts,
+# i.e. parts spatially separate from each other. Input features are broken down into individual parts and grouped by
+# adjacency by placing parts which touch each other in the same set. Once all parts are grouped, the number of sets is
+# equal to the number of disjoint spatial groups of parts. A number N>1 indicated the multipart route feature contains
+# disjoint parts. The disjoint-set structure also incidentally tests whether closed loops are formed by multiple
+# individual parts.
+class SetStruct:
+
+    def __init__(self, shape):
+
+        self.hasCycle = 0
+        self.numGroups = 0
+        self.nodes = []
+
+        sr = shape.spatialReference
+        self.shape = arcpy.MultipartToSinglepart_management(shape, arcpy.Geometry())
+
+        for part in self.shape:
+            self.nodes.append(self.ShapeNode(part))
+
+        self.__makeForest()
+
+    # Private class method that takes in a query node and traverses the tree it is in to find the root of that tree.
+    # Returns the root node.
+    def __find(self, node):
+
+        # Whenever a node is queried, a recursive call stack traverses to the root of the tree that node is currently
+        # located in. The recursive call stack implements path compression, setting the parent of each node traversed
+        # this way to the root of the tree. This significantly improved performance by shrinking the size of the tree,
+        # speeding up any future node queries.
+        if node.parent != node:
+            node.parent = self.__find(node.parent)
+        return node.parent
+
+    # Private class method to join two trees into one given a node in one tree that shares an edge with a node in
+    # another tree. If the two nodes are members of the same tree, no union is performed.
+    def __structUnion(self, nodeA, nodeB):
+
+        # Find the roots of the nodes sharing an edge. If both nodes are members of the same tree, there is a
+        # graph-theoretic cycle in the tree, indicating that the shapes in that tree somehow form a closed loop.
+        rootA = self.__find(nodeA)
+        rootB = self.__find(nodeB)
+        if rootA == rootB:
+            self.hasCycle = 1
+            return
+
+        # Ensure that rootA is always the node with higher rank, as it will become the parent.
+        if rootA.rank == rootB.rank:
+            rootA.rank += 1
+        elif rootA.rank < rootB.rank:
+            rootA, rootB = rootB, rootA
+
+        # Set the higher-ranked node as the root of the lower-ranked node. This helps limit the height of the find()
+        # call stack by preventing the tree from becoming too tall.
+        rootB.parent = rootA
+
+    # Function that constructs a forest of adjacency trees from a given set of nodes. Each combination of 2 nodes is
+    # tested for the existence of an edge between them. An edge between two nodes exists if and only if the shapes
+    # contained by the two nodes are not spatially disjoint (i.e. they touch each other). Once the forest is
+    # constructed, the instance property NumGroups is updated with the count of root nodes, which is equivalent to the
+    # number of trees in the forest.
+    def __makeForest(self):
+
+        for i, j in combinations(self.nodes, 2):
+            if not i.shape.disjoint(j.shape):
+                self.__structUnion(i, j)
+
+        roots = [n for n in self.nodes if n.parent == n]
+        self.numGroups = len(roots)
+
+    class ShapeNode:
+
+        def __init__(self, shape):
+            self.rank = 0
+            self.parent = self
+            self.shape = shape
+
+
+# If the script was executed as a standalone, run the main analysis function and afterward log the outcome.
+if __name__ == "__main__":
+    logfile = r"C:\MassDOT-Scripts\logs\RouteGeometry_NightlyLog.csv"
+    starttime = dt.datetime.utcnow()
+    results = main()
+    writeLog(logfile, (starttime, dt.datetime.utcnow()), results)
